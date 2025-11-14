@@ -178,6 +178,8 @@ def clean_walk(doc):
         "updatedAt": doc.get("updatedAt"),
         "notes": doc.get("notes"),
         "applications": applications,
+        "liveStartedAt": doc.get("liveStartedAt"),
+        "completedAt": doc.get("completedAt"),
     }
 
 
@@ -562,9 +564,10 @@ def delete_dog(dog_id):
 # Statuses:
 # - open           : created by owner, not yet taken
 # - pending_owner  : walker applied, waiting for owner decision
-# - confirmed      : owner confirmed walker
+# - live           : owner confirmed walker and walk is ongoing
+# - paused         : walker temporarily paused the walk
+# - completed      : walk finished
 # - canceled       : owner canceled
-# - declined       : owner declined this walker (goes back to open)
 
 @app.post("/api/walks")
 @jwt_required()
@@ -614,9 +617,12 @@ def create_walk():
         "candidateWalkerEmail": None,
         "walkerEmail": None,
         "chatId": None,
+        "liveStartedAt": None,
+        "completedAt": None,
         "notes": data.get("notes", "").strip() if isinstance(data.get("notes"), str) else "",
         "createdAt": now_iso(),
         "updatedAt": now_iso(),
+        "applications": [],
     }
 
     try:
@@ -741,26 +747,36 @@ def walker_apply_walk(walk_id):
         return jsonify({"ok": False, "error": "Walk already has a walker candidate."}), 409
 
     # create chat
+    timestamp = now_iso()
     chat_doc = {
         "walkId": oid,
         "ownerEmail": w["ownerEmail"],
         "walkerEmail": email,
         "status": "active",
-        "createdAt": now_iso(),
-        "updatedAt": now_iso(),
+        "createdAt": timestamp,
+        "updatedAt": timestamp,
     }
     try:
         chat_res = chats.insert_one(chat_doc)
         chat_doc["_id"] = chat_res.inserted_id
 
+        application_entry = {
+            "_id": ObjectId(),
+            "walkerEmail": email,
+            "status": "pending_owner",
+            "chatId": chat_doc["_id"],
+            "createdAt": timestamp,
+            "updatedAt": timestamp,
+        }
         walks.update_one(
             {"_id": oid},
             {
+                "$push": {"applications": application_entry},
                 "$set": {
                     "candidateWalkerEmail": email,
                     "status": "pending_owner",
                     "chatId": chat_doc["_id"],
-                    "updatedAt": now_iso(),
+                    "updatedAt": timestamp,
                 }
             },
         )
@@ -796,26 +812,77 @@ def owner_confirm_walk(walk_id):
     if not w:
         return jsonify({"ok": False, "error": "Walk not found for this owner."}), 404
 
-    if w.get("status") != "pending_owner" or not w.get("candidateWalkerEmail"):
+    if w.get("status") != "pending_owner":
         return jsonify({"ok": False, "error": "No walker candidate to confirm."}), 400
 
-    candidate = w["candidateWalkerEmail"]
+    candidate = None
+    applications = w.get("applications") or []
+    selected_app_id = None
+    data = request.get_json(silent=True) or {}
+    if applications:
+        app_id = data.get("applicationId")
+        if app_id:
+            target = next(
+                (app for app in applications if str(app.get("_id") or app.get("id")) == app_id),
+                None
+            )
+            if not target or target.get("status") != "pending_owner":
+                return jsonify({"ok": False, "error": "Application not found or already processed."}), 400
+            candidate = target.get("walkerEmail")
+            selected_app_id = str(target.get("_id") or target.get("id"))
+        else:
+            pending = next((app for app in applications if app.get("status") == "pending_owner"), None)
+            if pending:
+                candidate = pending.get("walkerEmail")
+                selected_app_id = str(pending.get("_id") or pending.get("id"))
+    if not candidate:
+        candidate = w.get("candidateWalkerEmail")
+    if not candidate:
+        return jsonify({"ok": False, "error": "No walker candidate to confirm."}), 400
+
+    now = now_iso()
+    updated_apps = []
+    if not applications and candidate:
+        updated_apps.append({
+            "_id": ObjectId(),
+            "walkerEmail": candidate,
+            "status": "accepted",
+            "chatId": w.get("chatId"),
+            "createdAt": now,
+            "updatedAt": now,
+        })
+    else:
+        for app in applications:
+            entry = dict(app)
+            identifier = str(app.get("_id") or app.get("id"))
+            if identifier == selected_app_id:
+                entry["status"] = "accepted"
+                entry["updatedAt"] = now
+            elif entry.get("status") == "pending_owner":
+                entry["status"] = "declined"
+                entry["updatedAt"] = now
+            updated_apps.append(entry)
+
     try:
         walks.update_one(
             {"_id": oid},
             {
                 "$set": {
-                    "status": "confirmed",
+                    "status": "live",
                     "walkerEmail": candidate,
-                    "updatedAt": now_iso(),
+                    "candidateWalkerEmail": None,
+                    "liveStartedAt": now,
+                    "completedAt": None,
+                    "updatedAt": now,
+                    "applications": updated_apps,
                 }
             },
         )
-        # keep candidateWalkerEmail for history (or clear it if you prefer)
+
         if w.get("chatId"):
             chats.update_one(
                 {"_id": w["chatId"]},
-                {"$set": {"status": "active", "updatedAt": now_iso()}},
+                {"$set": {"status": "active", "updatedAt": now}},
             )
         w = walks.find_one({"_id": oid})
     except mongo_errors.PyMongoError as e:
@@ -849,6 +916,27 @@ def owner_decline_walk(walk_id):
     if w.get("status") != "pending_owner" or not w.get("candidateWalkerEmail"):
         return jsonify({"ok": False, "error": "No walker candidate to decline."}), 400
 
+    candidate = w.get("candidateWalkerEmail")
+    applications = w.get("applications") or []
+    now = now_iso()
+    updated_apps = []
+    if not applications and candidate:
+        updated_apps.append({
+            "_id": ObjectId(),
+            "walkerEmail": candidate,
+            "status": "declined",
+            "chatId": w.get("chatId"),
+            "createdAt": w.get("createdAt"),
+            "updatedAt": now,
+        })
+    else:
+        for app in applications:
+            entry = dict(app)
+            if entry.get("walkerEmail") == candidate and entry.get("status") == "pending_owner":
+                entry["status"] = "declined"
+                entry["updatedAt"] = now
+            updated_apps.append(entry)
+
     try:
         walks.update_one(
             {"_id": oid},
@@ -856,14 +944,17 @@ def owner_decline_walk(walk_id):
                 "$set": {
                     "status": "open",
                     "candidateWalkerEmail": None,
-                    "updatedAt": now_iso(),
+                    "walkerEmail": None,
+                    "liveStartedAt": None,
+                    "updatedAt": now,
+                    "applications": updated_apps,
                 }
             },
         )
         if w.get("chatId"):
             chats.update_one(
                 {"_id": w["chatId"]},
-                {"$set": {"status": "declined", "updatedAt": now_iso()}},
+                {"$set": {"status": "declined", "updatedAt": now}},
             )
         w = walks.find_one({"_id": oid})
     except mongo_errors.PyMongoError as e:
@@ -893,20 +984,150 @@ def owner_cancel_walk(walk_id):
     if not w:
         return jsonify({"ok": False, "error": "Walk not found for this owner."}), 404
 
+    if w.get("status") not in {"open", "pending_owner"}:
+        return jsonify({"ok": False, "error": "Only open or pending walks can be canceled."}), 400
+
+    applications = w.get("applications") or []
+    now = now_iso()
+    updated_apps = []
+    for app in applications:
+        entry = dict(app)
+        if entry.get("status") in {"pending_owner", "accepted"}:
+            entry["status"] = "canceled"
+            entry["updatedAt"] = now
+        updated_apps.append(entry)
+
     try:
         walks.update_one(
             {"_id": oid},
             {
                 "$set": {
                     "status": "canceled",
-                    "updatedAt": now_iso(),
+                    "updatedAt": now,
+                    "applications": updated_apps,
                 }
             },
         )
         if w.get("chatId"):
             chats.update_one(
                 {"_id": w["chatId"]},
-                {"$set": {"status": "closed", "updatedAt": now_iso()}},
+                {"$set": {"status": "closed", "updatedAt": now}},
+            )
+        w = walks.find_one({"_id": oid})
+    except mongo_errors.PyMongoError as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    return jsonify({"ok": True, "item": clean_walk(w)}), 200
+
+
+@app.post("/api/walks/<walk_id>/pause")
+@jwt_required()
+def walker_pause_walk(walk_id):
+    """
+    Walker pauses an ongoing walk.
+    """
+    user = get_current_user_doc()
+    if not user:
+        return jsonify({"ok": False, "error": "User not found."}), 404
+    if user.get("role") != "walker":
+        return jsonify({"ok": False, "error": "Only walkers can pause walks."}), 403
+
+    walker_email = user["email"]
+    oid = safe_oid(walk_id)
+    if not oid:
+        return jsonify({"ok": False, "error": "Invalid walk id."}), 400
+
+    w = walks.find_one({"_id": oid, "walkerEmail": walker_email})
+    if not w:
+        return jsonify({"ok": False, "error": "Walk not found for this walker."}), 404
+
+    if w.get("status") != "live":
+        return jsonify({"ok": False, "error": "Only live walks can be paused."}), 400
+
+    now = now_iso()
+    try:
+        walks.update_one(
+            {"_id": oid},
+            {"$set": {"status": "paused", "updatedAt": now}}
+        )
+        w = walks.find_one({"_id": oid})
+    except mongo_errors.PyMongoError as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    return jsonify({"ok": True, "item": clean_walk(w)}), 200
+
+
+@app.post("/api/walks/<walk_id>/resume")
+@jwt_required()
+def walker_resume_walk(walk_id):
+    """
+    Walker resumes a paused walk.
+    """
+    user = get_current_user_doc()
+    if not user:
+        return jsonify({"ok": False, "error": "User not found."}), 404
+    if user.get("role") != "walker":
+        return jsonify({"ok": False, "error": "Only walkers can resume walks."}), 403
+
+    walker_email = user["email"]
+    oid = safe_oid(walk_id)
+    if not oid:
+        return jsonify({"ok": False, "error": "Invalid walk id."}), 400
+
+    w = walks.find_one({"_id": oid, "walkerEmail": walker_email})
+    if not w:
+        return jsonify({"ok": False, "error": "Walk not found for this walker."}), 404
+
+    if w.get("status") != "paused":
+        return jsonify({"ok": False, "error": "Only paused walks can be resumed."}), 400
+
+    now = now_iso()
+    try:
+        walks.update_one(
+            {"_id": oid},
+            {"$set": {"status": "live", "updatedAt": now}}
+        )
+        w = walks.find_one({"_id": oid})
+    except mongo_errors.PyMongoError as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+    return jsonify({"ok": True, "item": clean_walk(w)}), 200
+
+
+@app.post("/api/walks/<walk_id>/complete")
+@jwt_required()
+def walker_complete_walk(walk_id):
+    """
+    Walker marks the walk as completed.
+    """
+    user = get_current_user_doc()
+    if not user:
+        return jsonify({"ok": False, "error": "User not found."}), 404
+    if user.get("role") != "walker":
+        return jsonify({"ok": False, "error": "Only walkers can complete walks."}), 403
+
+    walker_email = user["email"]
+    oid = safe_oid(walk_id)
+    if not oid:
+        return jsonify({"ok": False, "error": "Invalid walk id."}), 400
+
+    w = walks.find_one({"_id": oid, "walkerEmail": walker_email})
+    if not w:
+        return jsonify({"ok": False, "error": "Walk not found for this walker."}), 404
+
+    if w.get("status") not in {"live", "paused"}:
+        return jsonify({"ok": False, "error": "Walk must be live or paused to complete."}), 400
+
+    now = now_iso()
+    try:
+        walks.update_one(
+            {"_id": oid},
+            {"$set": {"status": "completed", "completedAt": now, "updatedAt": now}}
+        )
+        if w.get("chatId"):
+            chats.update_one(
+                {"_id": w["chatId"]},
+                {"$set": {"status": "closed", "updatedAt": now}}
             )
         w = walks.find_one({"_id": oid})
     except mongo_errors.PyMongoError as e:
