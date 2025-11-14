@@ -160,10 +160,37 @@ def clean_dog(doc):
     }
 
 
+def load_dog_snapshot(doc):
+    pet_id = doc.get("petId")
+    if not pet_id:
+        return None
+    lookup = pet_id
+    if isinstance(pet_id, str):
+        lookup = safe_oid(pet_id)
+    if not isinstance(lookup, ObjectId):
+        return None
+    dog_doc = dogs.find_one({"_id": lookup})
+    if not dog_doc:
+        return None
+    return clean_dog(dog_doc)
+
+
+def load_user_snapshot(email):
+    if not email:
+        return None
+    user_doc = users.find_one({"email": email})
+    if not user_doc:
+        return None
+    return clean_user(user_doc)
+
+
 def clean_walk(doc):
     if not doc:
         return None
     applications = clean_applications(doc)
+    dog_snapshot = load_dog_snapshot(doc)
+    owner_snapshot = load_user_snapshot(doc.get("ownerEmail"))
+    walker_snapshot = load_user_snapshot(doc.get("walkerEmail"))
     return {
         "id": str(doc["_id"]),
         "ownerEmail": doc.get("ownerEmail"),
@@ -180,6 +207,11 @@ def clean_walk(doc):
         "applications": applications,
         "liveStartedAt": doc.get("liveStartedAt"),
         "completedAt": doc.get("completedAt"),
+        "plannedMinutes": doc.get("plannedMinutes"),
+        "distanceMeters": doc.get("distanceMeters", 0),
+        "dog": dog_snapshot,
+        "ownerProfile": owner_snapshot,
+        "walkerProfile": walker_snapshot,
     }
 
 
@@ -608,6 +640,14 @@ def create_walk():
     if not dt:
         return jsonify({"ok": False, "error": "Invalid startAt datetime format."}), 400
 
+    planned_minutes = data.get("plannedMinutes")
+    try:
+        planned_minutes = int(planned_minutes)
+        if planned_minutes <= 0 or planned_minutes > 240:
+            planned_minutes = 30
+    except (TypeError, ValueError):
+        planned_minutes = 30
+
     doc = {
         "ownerEmail": user["email"],
         "petId": pet_id,
@@ -619,6 +659,8 @@ def create_walk():
         "chatId": None,
         "liveStartedAt": None,
         "completedAt": None,
+        "plannedMinutes": planned_minutes,
+        "distanceMeters": 0,
         "notes": data.get("notes", "").strip() if isinstance(data.get("notes"), str) else "",
         "createdAt": now_iso(),
         "updatedAt": now_iso(),
@@ -843,14 +885,16 @@ def owner_confirm_walk(walk_id):
     now = now_iso()
     updated_apps = []
     if not applications and candidate:
+        temp_id = ObjectId()
         updated_apps.append({
-            "_id": ObjectId(),
+            "_id": temp_id,
             "walkerEmail": candidate,
             "status": "accepted",
             "chatId": w.get("chatId"),
             "createdAt": now,
             "updatedAt": now,
         })
+        selected_app_id = str(temp_id)
     else:
         for app in applications:
             entry = dict(app)
