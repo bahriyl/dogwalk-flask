@@ -163,6 +163,7 @@ def clean_dog(doc):
 def clean_walk(doc):
     if not doc:
         return None
+    applications = clean_applications(doc)
     return {
         "id": str(doc["_id"]),
         "ownerEmail": doc.get("ownerEmail"),
@@ -176,6 +177,7 @@ def clean_walk(doc):
         "createdAt": doc.get("createdAt"),
         "updatedAt": doc.get("updatedAt"),
         "notes": doc.get("notes"),
+        "applications": applications,
     }
 
 
@@ -191,6 +193,30 @@ def clean_chat(doc):
         "createdAt": doc.get("createdAt"),
         "updatedAt": doc.get("updatedAt"),
     }
+
+
+def clean_applications(doc):
+    applications = []
+    raw = doc.get("applications") or []
+    for entry in raw:
+        applications.append({
+            "id": str(entry.get("_id") or entry.get("id")),
+            "walkerEmail": entry.get("walkerEmail"),
+            "status": entry.get("status"),
+            "chatId": str(entry.get("chatId")) if entry.get("chatId") else None,
+            "createdAt": entry.get("createdAt"),
+            "updatedAt": entry.get("updatedAt"),
+        })
+    if not applications and doc.get("status") == "pending_owner" and not doc.get("walkerEmail") and doc.get("candidateWalkerEmail"):
+        applications.append({
+            "id": f"legacy-{doc.get('_id')}",
+            "walkerEmail": doc.get("candidateWalkerEmail"),
+            "status": "pending_owner",
+            "chatId": str(doc.get("chatId")) if doc.get("chatId") else None,
+            "createdAt": doc.get("createdAt"),
+            "updatedAt": doc.get("updatedAt"),
+        })
+    return applications
 
 
 def clean_message(doc):
